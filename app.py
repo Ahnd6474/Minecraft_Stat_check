@@ -1,12 +1,13 @@
 import streamlit as st
 from mcstatus import JavaServer, BedrockServer
 from streamlit_autorefresh import st_autorefresh
-
+import socket
+from contextlib import contextmanager
 # ---- Defaults
 DEFAULT_HOST = "xaprosmp.xyz"
 DEFAULT_JAVA_PORT = 25565
 DEFAULT_BEDROCK_PORT = 19132
-DEFAULT_EDITION = "Java"  # change to "Bedrock" if your server is Bedrock
+DEFAULT_EDITION = "Java"  # or "Bedrock"
 
 st.set_page_config(page_title="MC Status", page_icon="⛏️", layout="centered")
 st.title("Minecraft Server Status")
@@ -23,7 +24,10 @@ if "port" not in st.session_state:
 with st.container():
     colA, colB, colC = st.columns([1,1,1])
     with colA:
-        edition = st.radio("Edition", ["Java", "Bedrock"], horizontal=True, index=0 if st.session_state.edition=="Java" else 1)
+        edition = st.radio(
+            "Edition", ["Java", "Bedrock"], horizontal=True,
+            index=0 if st.session_state.edition == "Java" else 1
+        )
     with colB:
         host = st.text_input("Host / IP", value=st.session_state.host, placeholder="e.g., play.example.org")
     with colC:
@@ -32,16 +36,19 @@ with st.container():
                                min_value=1, max_value=65535, step=1)
 
     # One-click reset to your server
-    if st.button(f"Use {DEFAULT_HOST}"):
+    if st.button(f"Use {DEFAULT_HOST}", key="use_default"):
         st.session_state.host = DEFAULT_HOST
         st.session_state.edition = DEFAULT_EDITION
         st.session_state.port = DEFAULT_JAVA_PORT if DEFAULT_EDITION == "Java" else DEFAULT_BEDROCK_PORT
-        st.experimental_rerun()
+        # rerun for immediate UI update (Streamlit ≥1.24 uses st.rerun)
+        if hasattr(st, "rerun"):
+            st.rerun()
+        else:
+            st.experimental_rerun()
 
     timeout_ms = st.slider("Timeout (ms)", 500, 5000, 2500, 100)
     auto = st.checkbox("Auto-refresh every 30 s", value=True)
     if auto:
-        # triggers a rerun every 30s
         st_autorefresh(interval=30_000, key="mc_auto")
 
     manual = st.button("Check now", type="primary")
@@ -49,9 +56,20 @@ with st.container():
 # Persist any edits
 st.session_state.host = host.strip() or DEFAULT_HOST
 st.session_state.edition = edition
-st.session_state.port = int(port) if port else (DEFAULT_JAVA_PORT if edition=="Java" else DEFAULT_BEDROCK_PORT)
+st.session_state.port = int(port) if port else (DEFAULT_JAVA_PORT if edition == "Java" else DEFAULT_BEDROCK_PORT)
+# add near the top
 
-# ---- Helper
+
+@contextmanager
+def temp_socket_timeout(seconds: float):
+    prev = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(seconds)
+    try:
+        yield
+    finally:
+        socket.setdefaulttimeout(prev)
+
+# ---- Helpers
 def _clean_motd(desc):
     if desc is None:
         return None
@@ -65,35 +83,76 @@ def _clean_motd(desc):
         return None
 
 def check_status(host: str, port: int, edition: str, timeout_ms: int):
+    secs = max(0.1, timeout_ms / 1000.0)
+
+    def _status_with_timeout(server):
+        """Call server.status() compatibly across mcstatus versions."""
+        try:
+            # Newer mcstatus sometimes supports timeout=...
+            return server.status(timeout=secs)
+        except TypeError:
+            # Older mcstatus: no timeout kwarg → use socket default timeout
+            with temp_socket_timeout(secs):
+                return server.status()
+
+    def _ping_with_timeout(server):
+        """Get latency if status() doesn’t provide it."""
+        try:
+            return server.ping(timeout=secs)
+        except TypeError:
+            with temp_socket_timeout(secs):
+                return server.ping()
+        except Exception:
+            return None
+
     try:
         if edition == "Bedrock":
             server = BedrockServer.lookup(f"{host}:{port}")
-            stat = server.status(timeout=timeout_ms/1000.0)
+            stat = _status_with_timeout(server)
+
+            # mcstatus versions vary—grab fields defensively
+            players_online = getattr(stat, "players_online", None)
+            players_max    = getattr(stat, "players_max", None)
+            latency        = getattr(stat, "latency", None)
+            version        = getattr(stat, "version", None)
+            motd           = getattr(stat, "motd", None)
+
+            if latency is None:
+                latency = _ping_with_timeout(server)
+
             return {
                 "up": True, "edition": "bedrock",
-                "latency_ms": getattr(stat, "latency", None),
-                "players": {"online": getattr(stat, "players_online", None),
-                            "max": getattr(stat, "players_max", None)},
-                "version": {"name": getattr(stat, "version", None)},
-                "motd": getattr(stat, "motd", None),
+                "latency_ms": latency,
+                "players": {"online": players_online, "max": players_max},
+                "version": {"name": version},
+                "motd": motd,
             }
-        else:
-            server = JavaServer.lookup(f"{host}:{port}")  # resolves SRV if present
-            stat = server.status(timeout=timeout_ms/1000.0)
-            players = getattr(stat, "players", None)
+
+        else:  # Java
+            server = JavaServer.lookup(f"{host}:{port}")  # SRV aware
+            stat = _status_with_timeout(server)
+
+            players     = getattr(stat, "players", None)
+            online      = getattr(players, "online", None) if players else None
+            maxp        = getattr(players, "max", None) if players else None
             version_obj = getattr(stat, "version", None)
+            version     = getattr(version_obj, "name", None) if version_obj else None
+            desc        = getattr(stat, "description", None)
+            motd        = _clean_motd(desc)
+            latency     = getattr(stat, "latency", None) or _ping_with_timeout(server)
+
             return {
                 "up": True, "edition": "java",
-                "latency_ms": getattr(stat, "latency", None),
-                "players": {"online": getattr(players, "online", None) if players else None,
-                            "max": getattr(players, "max", None) if players else None},
-                "version": {"name": getattr(version_obj, "name", None) if version_obj else None},
-                "motd": _clean_motd(getattr(stat, "description", None)),
+                "latency_ms": latency,
+                "players": {"online": online, "max": maxp},
+                "version": {"name": version},
+                "motd": motd,
             }
+
     except Exception as e:
         return {"up": False, "error": str(e)}
 
-# ---- Run a check every rerun (covers initial load, auto, and manual)
+# ---- Run a check every rerun (initial, auto, or manual)
 with st.spinner("Pinging..."):
     result = check_status(st.session_state.host, st.session_state.port, st.session_state.edition, timeout_ms)
 
